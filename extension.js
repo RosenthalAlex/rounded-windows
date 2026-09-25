@@ -29,7 +29,6 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
-import Graphene from 'gi://Graphene';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
@@ -682,12 +681,32 @@ function visibleShape(actor) {
     const win = actor.metaWindow;
     const sc  = scaleFactor(win);
     const cfg = buildConfig();
-    const b   = computeBounds(actor);
 
-    const x1 = b.x1 + cfg.padding.left   * sc;
-    const y1 = b.y1 + cfg.padding.top    * sc;
-    const x2 = b.x2 - cfg.padding.right  * sc;
-    const y2 = b.y2 - cfg.padding.bottom * sc;
+    // Work from the window's frame and buffer rects rather than actor
+    // allocations: right after a window opens and resizes, actors can still
+    // carry their previous size while the rects are already current. The
+    // WindowActor sits at the buffer origin, so frame - buffer is in its
+    // coordinates (divided by Blur my Shell's own scale, which is 1 whenever
+    // the monitor framebuffer is scaled).
+    const bmsScale = global.blur_my_shell?._applications_blur?.compute_scale?.(win) || 1;
+    const buf   = win.get_buffer_rect();
+    const frame = win.get_frame_rect();
+
+    let x1 = frame.x - buf.x;
+    let y1 = frame.y - buf.y;
+    let x2 = x1 + frame.width;
+    let y2 = y1 + frame.height;
+
+    // Same anti-aliasing inset as computeBounds()
+    if (x1 === 0) x1 += sc;
+    if (y1 === 0) y1 += sc;
+    if (x2 === buf.width)  x2 -= sc;
+    if (y2 === buf.height) y2 -= sc;
+
+    x1 += cfg.padding.left   * sc;
+    y1 += cfg.padding.top    * sc;
+    x2 -= cfg.padding.right  * sc;
+    y2 -= cfg.padding.bottom * sc;
 
     // Same radius as RoundedCornersEffect; a squircle (exponent >= 2) always
     // contains the circle of the same radius
@@ -696,21 +715,12 @@ function visibleShape(actor) {
     if (maxR > 0 && radius > maxR)
         radius = maxR;
 
-    // computeBounds() is in target-actor space; the blur actor is a direct
-    // child of the WindowActor
-    const target = targetActor(actor) ?? actor;
-    const p1 = target.apply_relative_transform_to_point(
-        actor, new Graphene.Point3D({ x: x1, y: y1, z: 0 }));
-    const p2 = target.apply_relative_transform_to_point(
-        actor, new Graphene.Point3D({ x: x2, y: y2, z: 0 }));
-    const ratio = x2 > x1 ? (p2.x - p1.x) / (x2 - x1) : 1;
-
     return {
-        x: p1.x,
-        y: p1.y,
-        width:  p2.x - p1.x,
-        height: p2.y - p1.y,
-        radius: radius * ratio,
+        x: x1 / bmsScale,
+        y: y1 / bmsScale,
+        width:  (x2 - x1) / bmsScale,
+        height: (y2 - y1) / bmsScale,
+        radius: radius / bmsScale,
     };
 }
 
@@ -1083,6 +1093,9 @@ function attachWindowSignals(actor) {
     // and the surface container can appear after we attached
     addWinConn(actor, 'child-added',   () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
     addWinConn(actor, 'child-removed', () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
+
+    // Refit the blur to the new frame rect on every resize
+    addWinConn(win, 'size-changed', () => { if (actor.metaWindow) scheduleBmsSync(actor); });
 
     // Fullscreen state changed (may not cause a size change)
     addWinConn(win, 'notify::fullscreen',     () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
