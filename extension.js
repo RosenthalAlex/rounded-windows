@@ -46,6 +46,9 @@ const CLIP_SHADOW_EFFECT      = 'rwc-clip-shadow';
 const SHADOW_PADDING          = 80;   // extra pixels around the shadow actor
 // Name of the actor Blur my Shell inserts into a window actor to blur behind it
 const BMS_BLUR_ACTOR          = 'bms-application-blurred-widget';
+// ... and of the window border it draws on top of the window content
+const BMS_BORDER_ACTOR        = 'bms-window-border';
+const BMS_ACTORS              = [BMS_BLUR_ACTOR, BMS_BORDER_ACTOR];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Module-level state
@@ -274,7 +277,7 @@ function findTextureActor(actor) {
 
     // Blur my Shell's blur actor sits inside the window actor too; never
     // mistake (a child of) it for the window content
-    if (actor.name === BMS_BLUR_ACTOR)
+    if (BMS_ACTORS.includes(actor.name))
         return null;
 
     if (actor.get_texture?.())
@@ -319,7 +322,7 @@ function targetActor(actor) {
     // On GNOME 50 the surface actors do not answer get_texture() while the
     // WindowActor does; use the window's content child (the surface
     // container) rather than the WindowActor itself
-    const content = actor?.get_children?.().find(c => c.name !== BMS_BLUR_ACTOR);
+    const content = actor?.get_children?.().find(c => !BMS_ACTORS.includes(c.name));
     if (content)
         return content;
 
