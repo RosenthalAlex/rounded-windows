@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fix Blur my Shell's application blur showing nothing (translucent but unblurred windows) on GNOME < 50: apply the rounded corners effect to the window surface, not the whole window actor.
 - Blur my Shell compatibility: fit its application blur (static and dynamic) to the rounded, padded window shape, so no square blurred corners or edges show around translucent windows.
 
 ## v2.2.0

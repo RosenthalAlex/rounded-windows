@@ -300,8 +300,23 @@ function findTextureActor(actor) {
  * texture-bearing descendant actor. Applying the effect to that actor keeps
  * the shader aligned with the actual painted content instead of the outer
  * WindowActor container.
+ *
+ * Prefer that descendant even where the WindowActor itself exposes
+ * get_texture() (GNOME < 50). The effect is an offscreen effect: on the
+ * WindowActor it would also redirect Blur my Shell's blur actor (a sibling of
+ * the surface inside the WindowActor) into an offscreen buffer with nothing
+ * behind it to blur, leaving translucent but unblurred windows.
  */
 function targetActor(actor) {
+    let child = actor?.get_first_child?.() ?? null;
+    while (child) {
+        const textured = findTextureActor(child);
+        if (textured)
+            return textured;
+
+        child = child.get_next_sibling?.() ?? null;
+    }
+
     return findTextureActor(actor) ?? actor;
 }
 
