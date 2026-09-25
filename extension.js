@@ -317,7 +317,42 @@ function targetActor(actor) {
         child = child.get_next_sibling?.() ?? null;
     }
 
+    // On GNOME 50 the surface actors do not answer get_texture() while the
+    // WindowActor does; use the window's content child (the surface
+    // container) rather than the WindowActor itself
+    const content = actor?.get_children?.().find(c => c.name !== BMS_BLUR_ACTOR);
+    if (content)
+        return content;
+
     return findTextureActor(actor) ?? actor;
+}
+
+/** Call `fn` for `actor` and every descendant. */
+function forEachActor(actor, fn) {
+    fn(actor);
+    for (const child of actor.get_children?.() ?? [])
+        forEachActor(child, fn);
+}
+
+/**
+ * Put the effect on the current targetActor(), removing it from anywhere else
+ * in the window. The target changes when the window's actor tree does, e.g.
+ * when its surface appears after we first attached to the WindowActor.
+ */
+function moveEffectToTarget(actor) {
+    const target = targetActor(actor);
+    if (!target)
+        return null;
+
+    forEachActor(actor, a => {
+        if (a !== target && a.get_effect(ROUNDED_CORNERS_EFFECT))
+            a.remove_effect_by_name(ROUNDED_CORNERS_EFFECT);
+    });
+
+    if (!target.get_effect(ROUNDED_CORNERS_EFFECT))
+        target.add_effect_with_name(ROUNDED_CORNERS_EFFECT, new RoundedCornersEffect());
+
+    return target.get_effect(ROUNDED_CORNERS_EFFECT);
 }
 
 function getWindowTexture(actor) {
@@ -721,6 +756,17 @@ function watchBmsBlurActor(actor, data, blur) {
     if (!blur)
         return;
 
+    // the blur actor (and its effects) die before the window when Blur my
+    // Shell removes the blur; disconnecting from them afterwards only makes
+    // GJS log criticals, their handlers go away with them anyway
+    data.bmsConnections.push({
+        obj: blur,
+        id: blur.connect('destroy', () => {
+            data.bmsConnections = [];
+            data.bmsBlur = null;
+        }),
+    });
+
     const resync = () => scheduleBmsSync(actor);
     for (const prop of ['x', 'y', 'width', 'height', 'clip-rect'])
         data.bmsConnections.push({ obj: blur, id: blur.connect(`notify::${prop}`, resync) });
@@ -825,9 +871,10 @@ function onRemoveEffect(actor) {
     } catch (_) {}
 
     try {
-        const target = targetActor(actor);
-        if (target)
-            target.remove_effect_by_name(ROUNDED_CORNERS_EFFECT);
+        forEachActor(actor, a => {
+            if (a.get_effect(ROUNDED_CORNERS_EFFECT))
+                a.remove_effect_by_name(ROUNDED_CORNERS_EFFECT);
+        });
     } catch (_) {
         // Actor may already be destroyed
     }
@@ -874,7 +921,7 @@ function refreshRoundedCorners(actor) {
     if (!win) return;
 
     const data = _actorMap.get(actor);
-    const fx   = getEffect(actor);
+    let fx     = getEffect(actor);
 
     // If neither the effect nor actor data exists, add the effect.
     // Guard against re-entry: only call onAddEffect when there is no _actorMap
@@ -890,6 +937,10 @@ function refreshRoundedCorners(actor) {
         if (data) onRemoveEffect(actor);
         return;
     }
+
+    // the actor tree changed since the effect was attached
+    if (!fx && data)
+        fx = moveEffectToTarget(actor);
 
     if (!fx) return;   // effect was removed due to shouldSkip during onAddEffect
     if (!fx.enabled) fx.enabled = true;
@@ -989,8 +1040,9 @@ function attachWindowSignals(actor) {
         addWinConn(texture, 'size-changed', () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
 
     // Blur my Shell adds / removes its blur actor inside the window actor
-    addWinConn(actor, 'child-added',   () => { if (actor.metaWindow) scheduleBmsSync(actor); });
-    addWinConn(actor, 'child-removed', () => { if (actor.metaWindow) scheduleBmsSync(actor); });
+    // and the surface container can appear after we attached
+    addWinConn(actor, 'child-added',   () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
+    addWinConn(actor, 'child-removed', () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
 
     // Fullscreen state changed (may not cause a size change)
     addWinConn(win, 'notify::fullscreen',     () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
