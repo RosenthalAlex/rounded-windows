@@ -327,6 +327,40 @@ function targetActor(actor) {
     return findTextureActor(actor) ?? actor;
 }
 
+/**
+ * Refresh when the effect target itself is resized. The WindowActor's
+ * notify::size fires before its children are allocated, so when the target is
+ * a child (the surface container), it still has its old size at that point;
+ * e.g. a window opening at one size and immediately resizing kept the stale
+ * bounds (border, blur) until the next manual resize.
+ */
+function watchTargetSize(actor, data) {
+    const target = targetActor(actor);
+    if (!target || target === actor || data.sizeTarget === target)
+        return;
+
+    unwatchTargetSize(data);
+    data.sizeTarget = target;
+    data.sizeTargetIds = [
+        target.connect('notify::size', () => {
+            if (actor.metaWindow)
+                refreshRoundedCorners(actor);
+        }),
+        target.connect('destroy', () => {
+            data.sizeTarget = null;
+            data.sizeTargetIds = [];
+        }),
+    ];
+}
+
+function unwatchTargetSize(data) {
+    for (const id of data.sizeTargetIds ?? []) {
+        try { data.sizeTarget?.disconnect(id); } catch (_) {}
+    }
+    data.sizeTarget = null;
+    data.sizeTargetIds = [];
+}
+
 /** Call `fn` for `actor` and every descendant. */
 function forEachActor(actor, fn) {
     fn(actor);
@@ -860,6 +894,8 @@ function onAddEffect(actor) {
         bmsBlur: null,
         bmsConnections: [],
         bmsLaterId: 0,
+        sizeTarget: null,
+        sizeTargetIds: [],
     });
     refreshRoundedCorners(actor);
 }
@@ -883,6 +919,7 @@ function onRemoveEffect(actor) {
     if (!data) return;
 
     releaseBmsBlur(actor, data);
+    unwatchTargetSize(data);
 
     // Disconnect per-window signals safely
     if (data.connections) {
@@ -944,6 +981,9 @@ function refreshRoundedCorners(actor) {
 
     if (!fx) return;   // effect was removed due to shouldSkip during onAddEffect
     if (!fx.enabled) fx.enabled = true;
+
+    if (data)
+        watchTargetSize(actor, data);
 
     const cfg = buildConfig();
     fx.updateUniforms(scaleFactor(win), cfg, computeBounds(actor));
