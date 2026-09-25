@@ -29,6 +29,7 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Graphene from 'gi://Graphene';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
@@ -44,6 +45,8 @@ import { RoundedCornersEffect, ClipShadowEffect } from './effect.js';
 const ROUNDED_CORNERS_EFFECT = 'rwc-rounded-corners';
 const CLIP_SHADOW_EFFECT      = 'rwc-clip-shadow';
 const SHADOW_PADDING          = 80;   // extra pixels around the shadow actor
+// Name of the actor Blur my Shell inserts into a window actor to blur behind it
+const BMS_BLUR_ACTOR          = 'bms-application-blurred-widget';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Module-level state
@@ -268,6 +271,11 @@ function shouldSkip(win) {
 
 function findTextureActor(actor) {
     if (!actor)
+        return null;
+
+    // Blur my Shell's blur actor sits inside the window actor too; never
+    // mistake (a child of) it for the window content
+    if (actor.name === BMS_BLUR_ACTOR)
         return null;
 
     if (actor.get_texture?.())
@@ -569,6 +577,182 @@ function refreshShadowClip(actor, shadowActor) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Blur my Shell compatibility
+//
+// Blur my Shell's application blur puts a blur actor behind the window content,
+// sized to the square frame rect. With a translucent window, the part of that
+// blur outside our rounded (and padded) shape shows as square blurred corners
+// and edges. Fit the blur actor to the visible shape instead, and re-assert it
+// whenever Blur my Shell repositions it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function findBmsBlurActor(actor) {
+    return actor.get_children().find(child => child.name === BMS_BLUR_ACTOR) ?? null;
+}
+
+/**
+ * The visible rounded window area, in WindowActor coordinates, and the corner
+ * radius of a circular arc that stays inside our squircle corner.
+ */
+function visibleShape(actor) {
+    const win = actor.metaWindow;
+    const sc  = scaleFactor(win);
+    const cfg = buildConfig();
+    const b   = computeBounds(actor);
+
+    const x1 = b.x1 + cfg.padding.left   * sc;
+    const y1 = b.y1 + cfg.padding.top    * sc;
+    const x2 = b.x2 - cfg.padding.right  * sc;
+    const y2 = b.y2 - cfg.padding.bottom * sc;
+
+    // Same radius as RoundedCornersEffect; a squircle (exponent >= 2) always
+    // contains the circle of the same radius
+    let radius = cfg.cornerRadius * sc * 0.5 * (cfg.smoothing * 10 + 2);
+    const maxR = Math.min(x2 - x1, y2 - y1) / 2;
+    if (maxR > 0 && radius > maxR)
+        radius = maxR;
+
+    // computeBounds() is in target-actor space; the blur actor is a direct
+    // child of the WindowActor
+    const target = targetActor(actor) ?? actor;
+    const p1 = target.apply_relative_transform_to_point(
+        actor, new Graphene.Point3D({ x: x1, y: y1, z: 0 }));
+    const p2 = target.apply_relative_transform_to_point(
+        actor, new Graphene.Point3D({ x: x2, y: y2, z: 0 }));
+    const ratio = x2 > x1 ? (p2.x - p1.x) / (x2 - x1) : 1;
+
+    return {
+        x: p1.x,
+        y: p1.y,
+        width:  p2.x - p1.x,
+        height: p2.y - p1.y,
+        radius: radius * ratio,
+    };
+}
+
+const differs = (a, b) => Math.abs(a - b) > 0.01;
+
+/** Fit Blur my Shell's blur actor (if any) to the rounded window shape. */
+function syncBmsBlur(actor) {
+    const data = _actorMap.get(actor);
+    if (!data || !actor.metaWindow)
+        return;
+
+    const blur = findBmsBlurActor(actor);
+    watchBmsBlurActor(actor, data, blur);
+    if (!blur || !getEffect(actor))
+        return;
+
+    const shape = visibleShape(actor);
+    if (shape.width <= 0 || shape.height <= 0)
+        return;
+
+    // Static blur shows a monitor-sized wallpaper actor clipped to the window;
+    // dynamic blur is an empty actor that blurs what is behind it
+    const isStatic = blur.get_children().some(c => c instanceof Meta.BackgroundActor);
+    if (isStatic) {
+        const clip = [shape.x - blur.x, shape.y - blur.y, shape.width, shape.height];
+        const current = blur.has_clip ? blur.get_clip() : null;
+        if (!current || clip.some((v, i) => differs(v, current[i])))
+            blur.set_clip(...clip);
+    } else {
+        if (differs(blur.x, shape.x) || differs(blur.y, shape.y))
+            blur.set_position(shape.x, shape.y);
+        if (differs(blur.width, shape.width) || differs(blur.height, shape.height))
+            blur.set_size(shape.width, shape.height);
+    }
+
+    // Blur my Shell's corner radii are unscaled (multiplied by the theme scale)
+    const themeScale = St.ThemeContext.get_for_stage(global.stage).scale_factor || 1;
+    const radius = shape.radius / themeScale;
+    for (const effect of blur.get_effects()) {
+        if ('unscaled_corner_radius' in effect) {
+            // native dynamic blur (rounded when the Shell supports it)
+            if (differs(effect.unscaled_corner_radius, radius))
+                effect.unscaled_corner_radius = radius;
+        } else if (effect.constructor.name === 'CornerEffect') {
+            // corner effect of a static blur pipeline
+            if (effect.straight_corners)
+                effect.straight_corners = false;
+            if (differs(effect.radius, radius))
+                effect.radius = radius;
+        }
+    }
+}
+
+/** Coalesce re-syncs into one pass right before the next redraw. */
+function scheduleBmsSync(actor) {
+    const data = _actorMap.get(actor);
+    if (!data || data.bmsLaterId)
+        return;
+
+    data.bmsLaterId = global.compositor.get_laters().add(Meta.LaterType.BEFORE_REDRAW, () => {
+        data.bmsLaterId = 0;
+        syncBmsBlur(actor);
+        return GLib.SOURCE_REMOVE;
+    });
+}
+
+/**
+ * Follow Blur my Shell's own updates of its blur actor (resize, move,
+ * maximize, settings changes) so our shape is re-applied on top of them.
+ */
+function watchBmsBlurActor(actor, data, blur) {
+    if (data.bmsBlur === blur)
+        return;
+
+    unwatchBmsBlurActor(data);
+    data.bmsBlur = blur;
+    if (!blur)
+        return;
+
+    const resync = () => scheduleBmsSync(actor);
+    for (const prop of ['x', 'y', 'width', 'height', 'clip-rect'])
+        data.bmsConnections.push({ obj: blur, id: blur.connect(`notify::${prop}`, resync) });
+
+    for (const effect of blur.get_effects()) {
+        for (const prop of ['corner-radius', 'radius']) {
+            if (effect.constructor.find_property?.(prop)) {
+                data.bmsConnections.push({
+                    obj: effect,
+                    id: effect.connect(`notify::${prop}`, resync),
+                });
+            }
+        }
+    }
+}
+
+function unwatchBmsBlurActor(data) {
+    for (const c of data.bmsConnections ?? []) {
+        try { c.obj.disconnect(c.id); } catch (_) {}
+    }
+    data.bmsConnections = [];
+    data.bmsBlur = null;
+}
+
+/** Stop fitting the blur and let Blur my Shell restore its own geometry. */
+function releaseBmsBlur(actor, data) {
+    const hadBlur = Boolean(data.bmsBlur);
+    unwatchBmsBlurActor(data);
+    if (data.bmsLaterId) {
+        global.compositor.get_laters().remove(data.bmsLaterId);
+        data.bmsLaterId = 0;
+    }
+
+    const win  = actor.metaWindow;
+    const apps = global.blur_my_shell?._applications_blur;
+    if (!hadBlur || !win?.blur_actor || !apps || !win.bms_pid)
+        return;
+
+    try {
+        apps.update_size(win.bms_pid);
+        apps.update_corner_radius(win);
+    } catch (_) {
+        // Blur my Shell internals changed or the window is going away
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Effect application / removal
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -612,6 +796,9 @@ function onAddEffect(actor) {
         connections: [],
         signalsAttached: false,
         timeoutId: 0,
+        bmsBlur: null,
+        bmsConnections: [],
+        bmsLaterId: 0,
     });
     refreshRoundedCorners(actor);
 }
@@ -632,6 +819,8 @@ function onRemoveEffect(actor) {
 
     const data = _actorMap.get(actor);
     if (!data) return;
+
+    releaseBmsBlur(actor, data);
 
     // Disconnect per-window signals safely
     if (data.connections) {
@@ -692,6 +881,7 @@ function refreshRoundedCorners(actor) {
 
     const cfg = buildConfig();
     fx.updateUniforms(scaleFactor(win), cfg, computeBounds(actor));
+    scheduleBmsSync(actor);
 
     // Update shadow
     if (data) {
@@ -782,6 +972,10 @@ function attachWindowSignals(actor) {
     addWinConn(actor,   'notify::size',  () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
     if (texture)
         addWinConn(texture, 'size-changed', () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
+
+    // Blur my Shell adds / removes its blur actor inside the window actor
+    addWinConn(actor, 'child-added',   () => { if (actor.metaWindow) scheduleBmsSync(actor); });
+    addWinConn(actor, 'child-removed', () => { if (actor.metaWindow) scheduleBmsSync(actor); });
 
     // Fullscreen state changed (may not cause a size change)
     addWinConn(win, 'notify::fullscreen',     () => { if (actor.metaWindow) refreshRoundedCorners(actor); });
