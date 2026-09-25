@@ -1121,9 +1121,13 @@ function applyEffectTo(actor) {
         return;
     }
 
-    // Wayland / XWayland windows may not have a surface child yet.
-    if (!actor.get_first_child?.()) {
-        const connId = actor.connect('notify::first-child', () => {
+    // Wayland / XWayland windows may not have a surface child yet. Blur my
+    // Shell's actors can be added before it, and do not count: attaching now
+    // would put the effect on the WindowActor itself.
+    if (!actor.get_children?.().some(c => !BMS_ACTORS.includes(c.name))) {
+        const connId = actor.connect('child-added', () => {
+            if (!actor.get_children().some(c => !BMS_ACTORS.includes(c.name)))
+                return;
             actor.disconnect(connId);
             applyEffectTo(actor);
         });
